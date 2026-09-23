@@ -100,8 +100,27 @@ jobs:
 
       - name: Determine pinned pico-sdk version
         id: pico_sdk
+        working-directory: gp2040-ce
         run: |
-          REF=$(grep -A2 "repository: raspberrypi/pico-sdk" gp2040-ce/.github/workflows/cmake.yml | grep "ref:" | head -n1 | sed -E 's/.*ref:\s*//')
+          REF=""
+
+          # Newer GP2040-CE workflows check out pico-sdk explicitly with a pinned ref.
+          if grep -q "repository: raspberrypi/pico-sdk" .github/workflows/cmake.yml; then
+            REF=$(grep -A2 "repository: raspberrypi/pico-sdk" .github/workflows/cmake.yml | grep "ref:" | head -n1 | sed -E 's/.*ref:[[:space:]]*//; s/["'"'"']//g' | xargs)
+          fi
+
+          # Older GP2040-CE workflows delegate SDK setup to this action, which pins its own pico-sdk ref.
+          if [[ -z "${REF}" ]] && grep -qo "Fortinbra/RaspberryPiPicoBuild@[^[:space:]\"']*" .github/workflows/cmake.yml; then
+            ACTION_TAG=$(grep -oE "Fortinbra/RaspberryPiPicoBuild@[^[:space:]\"']+" .github/workflows/cmake.yml | head -n1 | cut -d'@' -f2)
+            ACTION_YML=$(curl -sfL "https://raw.githubusercontent.com/Fortinbra/RaspberryPiPicoBuild/${ACTION_TAG}/action.yml")
+            REF=$(echo "${ACTION_YML}" | grep -A2 "repository: raspberrypi/pico-sdk" | grep "ref:" | head -n1 | sed -E 's/.*ref:[[:space:]]*//; s/["'"'"']//g' | xargs)
+          fi
+
+          if [[ -z "${REF}" ]]; then
+            echo "::error::Could not determine the pico-sdk version pinned by GP2040-CE for this release. Refusing to guess (would silently build against an incompatible pico-sdk)."
+            exit 1
+          fi
+
           echo "ref=${REF}" >> "$GITHUB_OUTPUT"
           echo "Using pico-sdk ${REF}"
 
