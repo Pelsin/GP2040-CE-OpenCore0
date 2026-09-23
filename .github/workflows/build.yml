@@ -1,0 +1,158 @@
+name: Build OpenCore0 on upstream release
+
+env:
+  UPSTREAM_REPO: OpenStickCommunity/GP2040-CE
+  BOARD_CONFIG: OpenCore0
+  BUILD_TYPE: Release
+
+
+on:
+  schedule:
+    # Poll for new upstream releases every 6 hours, perhaps should be done once every day
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Build even if no new upstream release was found'
+        type: boolean
+        default: false
+  push:
+    branches: ["main"]
+    paths:
+      - 'BoardConfig.h'
+      - 'Open_Core0.h'
+      - 'assets/**'
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.compare.outputs.should_build }}
+      upstream_tag: ${{ steps.upstream.outputs.tag }}
+    steps:
+      - name: Get latest upstream release tag
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release: ${TAG}"
+
+      - name: Get latest release tag already built by this repo
+        id: current
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name 2>/dev/null || true)
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Last built release: ${TAG:-<none>}"
+
+      - name: Decide whether to build
+        id: compare
+        run: |
+          if [[ "${{ github.event_name }}" == "push" || "${{ github.event.inputs.force }}" == "true" || "${{ steps.upstream.outputs.tag }}" != "${{ steps.current.outputs.tag }}" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    runs-on: ubuntu-22.04
+    env:
+      UPSTREAM_TAG: ${{ needs.check-release.outputs.upstream_tag }}
+    steps:
+      - name: Checkout this config repo
+        uses: actions/checkout@v4
+        with:
+          path: config
+
+      - name: Checkout GP2040-CE @ ${{ env.UPSTREAM_TAG }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_TAG }}
+          path: gp2040-ce
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Overlay ${{ env.BOARD_CONFIG }} config from this repo
+        run: |
+          rm -rf "gp2040-ce/configs/${BOARD_CONFIG}"
+          mkdir -p "gp2040-ce/configs/${BOARD_CONFIG}"
+          cp config/BoardConfig.h config/Open_Core0.h "gp2040-ce/configs/${BOARD_CONFIG}/"
+          cp -r config/assets "gp2040-ce/configs/${BOARD_CONFIG}/assets"
+
+      - name: Determine pinned pico-sdk version
+        id: pico_sdk
+        run: |
+          REF=$(grep -A2 "repository: raspberrypi/pico-sdk" gp2040-ce/.github/workflows/cmake.yml | grep "ref:" | head -n1 | sed -E 's/.*ref:\s*//')
+          echo "ref=${REF}" >> "$GITHUB_OUTPUT"
+          echo "Using pico-sdk ${REF}"
+
+      - name: Checkout pico-sdk ${{ steps.pico_sdk.outputs.ref }}
+        uses: actions/checkout@v4
+        with:
+          repository: raspberrypi/pico-sdk
+          ref: ${{ steps.pico_sdk.outputs.ref }}
+          path: pico-sdk
+
+      - name: Checkout pico-sdk submodules
+        working-directory: pico-sdk
+        run: git submodule update --init
+
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: "3.31.x"
+
+      - name: arm-none-eabi-gcc GNU Arm Embedded Toolchain
+        uses: carlosperate/arm-none-eabi-gcc-action@v1
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+          cache-dependency-path: gp2040-ce/www/package-lock.json
+
+      - name: Build web configurator (fsdata.c)
+        working-directory: gp2040-ce/www
+        run: |
+          npm ci
+          CI=false npm run build --if-present
+
+      - name: Get core count
+        id: core_count
+        run: echo "output=$(nproc)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure CMake
+        working-directory: gp2040-ce
+        run: PICO_SDK_PATH="${{ github.workspace }}/pico-sdk" GP2040_BOARDCONFIG="${BOARD_CONFIG}" SKIP_WEBBUILD=TRUE cmake -B build -DCMAKE_BUILD_TYPE="${BUILD_TYPE}"
+
+      - name: Build
+        working-directory: gp2040-ce
+        run: GP2040_BOARDCONFIG="${BOARD_CONFIG}" cmake --build build --config "${BUILD_TYPE}" --parallel ${{ steps.core_count.outputs.output }}
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GP2040-CE-${{ env.BOARD_CONFIG }}-${{ env.UPSTREAM_TAG }}
+          path: gp2040-ce/build/GP2040-CE_*_${{ env.BOARD_CONFIG }}.uf2
+          if-no-files-found: error
+
+      - name: Publish release
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.UPSTREAM_TAG }}
+          name: OpenCore0 - ${{ env.UPSTREAM_TAG }}
+          body: |
+            Automated build of [GP2040-CE ${{ env.UPSTREAM_TAG }}](https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${{ env.UPSTREAM_TAG }}) for the OpenCore0 board config.
+          files: gp2040-ce/build/GP2040-CE_*_${{ env.BOARD_CONFIG }}.uf2
