@@ -1,10 +1,9 @@
-name: Build OpenCore0 on upstream release
+name: Build OpenCore0
 
 env:
   UPSTREAM_REPO: OpenStickCommunity/GP2040-CE
   BOARD_CONFIG: OpenCore0
   BUILD_TYPE: Release
-
 
 on:
   schedule:
